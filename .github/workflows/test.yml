@@ -1,0 +1,455 @@
+# OctoFetch-Release-Version: 4 (ULTIMATE)
+# Zero paid dependencies. Pure GitHub Actions + bash.
+# Features: resumable downloads, parallel uploads, atomic manifests, checksums.
+
+name: 'Ultimate GitHub Release Upload Engine'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Direct file URL to download and attach to the release'
+        required: true
+        type: string
+      folder_name:
+        description: 'Folder identifier used for the links manifest path'
+        required: true
+        type: string
+      release_tag:
+        description: 'Tag name for the GitHub release (created if absent)'
+        required: true
+        type: string
+      release_title:
+        description: 'Release title shown on GitHub (defaults to the tag)'
+        required: false
+        type: string
+        default: ''
+      safe_mode:
+        description: 'Replace the source filename with the sanitised folder name'
+        required: false
+        type: string
+        default: 'true'
+      asset_name:
+        description: 'Optional explicit asset filename (overrides URL parsing)'
+        required: false
+        type: string
+        default: ''
+      chunk_threshold_bytes:
+        description: 'Files larger than this are split into N parts before upload'
+        required: false
+        type: string
+        default: '2040109465'  # ~1.95 GiB (leaves headroom for 2 GiB limit)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.release_tag }}-${{ github.event.inputs.folder_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+
+      # ----------------------------------------------------------------------
+      # 1. Minimal checkout – only git metadata and .octofetch folder
+      # ----------------------------------------------------------------------
+      - name: Checkout (sparse, fast)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+            .octofetch
+          sparse-checkout-cone-mode: false
+
+      # ----------------------------------------------------------------------
+      # 2. Install required tools (aria2 for resumable downloads, jq, etc.)
+      # ----------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 jq coreutils pv
+          gh --version >/dev/null
+
+      # ----------------------------------------------------------------------
+      # 3. Pre-flight: check URL accessibility + available disk space
+      # ----------------------------------------------------------------------
+      - name: Validate URL and disk space
+        env:
+          URL: ${{ github.event.inputs.file_url }}
+        run: |
+          set -euo pipefail
+
+          # 3.1 Check HTTP response (follow redirects, accept 200/206)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -L "$URL")
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "206" ]]; then
+            echo "::error::URL returned $HTTP_CODE – not accessible (must return 200 or 206)"
+            exit 1
+          fi
+
+          # 3.2 Get content length (if server provides it)
+          CONTENT_LENGTH=$(curl -sI -L "$URL" | grep -i content-length | awk '{print $2}' | tr -d '\r')
+          if [[ -n "$CONTENT_LENGTH" && "$CONTENT_LENGTH" -gt 0 ]]; then
+            AVAILABLE_SPACE=$(df --output=avail / | tail -1)
+            if [[ "$CONTENT_LENGTH" -gt "$AVAILABLE_SPACE" ]]; then
+              echo "::error::Need ${CONTENT_LENGTH} bytes but only ${AVAILABLE_SPACE} available on runner"
+              echo "::error::Free space or reduce file size"
+              exit 1
+            fi
+            echo "FILE_SIZE=$CONTENT_LENGTH" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Could not determine file size – proceeding anyway"
+          fi
+
+      # ----------------------------------------------------------------------
+      # 4. Download file with aria2 (resumable, parallel connections)
+      # ----------------------------------------------------------------------
+      - name: Download source file (resumable, parallel)
+        env:
+          URL: ${{ github.event.inputs.file_url }}
+          FOLDER_INPUT: ${{ github.event.inputs.folder_name }}
+          SAFE_MODE: ${{ github.event.inputs.safe_mode }}
+          OVERRIDE_NAME: ${{ github.event.inputs.asset_name }}
+        run: |
+          set -euo pipefail
+
+          # Sanitize folder name
+          FOLDER=$(printf '%s' "$FOLDER_INPUT" | tr -c 'A-Za-z0-9._-' '_')
+          if [ ${#FOLDER} -gt 100 ]; then
+            FOLDER="${FOLDER:0:100}"
+          fi
+          if [ -z "$FOLDER" ]; then
+            FOLDER="REL_$(date +%Y%m%d%H%M%S)"
+          fi
+          echo "FOLDER=$FOLDER" >> "$GITHUB_ENV"
+
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+          # ------------------------------------------------------------------
+          # Pure bash function to extract filename from Content-Disposition
+          # (No Python, no external deps)
+          # ------------------------------------------------------------------
+          get_filename_from_cd() {
+            local url="$1"
+            local ua="$2"
+            local filename=""
+
+            # Try HEAD then GET (some servers only give CD on GET)
+            for method in HEAD GET; do
+              if [ "$method" = "HEAD" ]; then
+                headers=$(curl -sI -L -H "User-Agent: $ua" "$url" 2>/dev/null)
+              else
+                headers=$(curl -sI -L -H "User-Agent: $ua" -H "Range: bytes=0-0" "$url" 2>/dev/null)
+              fi
+
+              # RFC 5987: filename*=UTF-8''urlencoded
+              if [[ "$headers" =~ filename\*\=([^\;]+)\'([^\']*)\'([^\;]+) ]]; then
+                encoded="${BASH_REMATCH[3]}"
+                # Decode percent-encoding
+                printf -v filename '%b' "${encoded//%/\\x}"
+                break
+              # RFC 6266: filename="quoted"
+              elif [[ "$headers" =~ filename\=\"([^\"]+)\" ]]; then
+                filename="${BASH_REMATCH[1]}"
+                break
+              # Unquoted fallback
+              elif [[ "$headers" =~ filename\=([^\;\ ]+) ]]; then
+                filename="${BASH_REMATCH[1]}"
+                break
+              fi
+            done
+
+            if [ -n "$filename" ]; then
+              echo "$filename"
+            else
+              # fallback to basename of URL (strip query)
+              basename "${url%%\?*}"
+            fi
+          }
+
+          # Determine final asset name
+          if [ -n "$OVERRIDE_NAME" ]; then
+            RAW_NAME="$OVERRIDE_NAME"
+          else
+            CD_NAME=$(get_filename_from_cd "$URL" "$UA")
+            echo "🔍 Filename from Content-Disposition / URL: $CD_NAME"
+            RAW_NAME="$CD_NAME"
+          fi
+
+          # Sanitize: remove control chars, limit length
+          RAW_NAME=$(printf '%s' "$RAW_NAME" | tr -d '\000-\037')
+          if [ ${#RAW_NAME} -gt 180 ]; then
+            RAW_NAME="${RAW_NAME:0:180}"
+          fi
+
+          EXT="${RAW_NAME##*.}"
+          if [ ${#EXT} -gt 12 ] || [ "$EXT" = "$RAW_NAME" ]; then
+            EXT="bin"
+          fi
+
+          if [ "$SAFE_MODE" = "true" ]; then
+            FINAL_FILE="$FOLDER.$EXT"
+          else
+            NAME_NO_EXT="${RAW_NAME%.*}"
+            if [ ${#NAME_NO_EXT} -gt 100 ]; then
+              NAME_NO_EXT="${NAME_NO_EXT:0:100}"
+            fi
+            NAME_NO_EXT=$(printf '%s' "$NAME_NO_EXT" | tr -c 'A-Za-z0-9._() -' '_')
+            if [ -z "$NAME_NO_EXT" ]; then
+              NAME_NO_EXT="$FOLDER"
+            fi
+            FINAL_FILE="$NAME_NO_EXT.$EXT"
+          fi
+          echo "FINAL_FILE=$FINAL_FILE" >> "$GITHUB_ENV"
+
+          # Use aria2 with resume support (--continue=true)
+          mkdir -p source_file
+          aria2c \
+            --console-log-level=warn \
+            --summary-interval=5 \
+            --download-result=hide \
+            -x 16 -s 16 -k 1M \
+            --max-tries=10 \
+            --retry-wait=5 \
+            --connect-timeout=20 \
+            --timeout=60 \
+            --user-agent="$UA" \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --continue=true \
+            --check-certificate=true \
+            -d "source_file" -o "$FINAL_FILE" \
+            "$URL"
+
+          if [ ! -s "source_file/$FINAL_FILE" ]; then
+            echo "::error::Downloaded file is empty or missing: $FINAL_FILE"
+            exit 1
+          fi
+
+          # Generate SHA256 checksum for integrity
+          sha256sum "source_file/$FINAL_FILE" | cut -d' ' -f1 > "source_file/$FINAL_FILE.sha256"
+          echo "CHECKSUM=$(cat source_file/$FINAL_FILE.sha256)" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # 5. Split large files (if needed) respecting GitHub's 2 GiB asset limit
+      # ----------------------------------------------------------------------
+      - name: Split large files
+        env:
+          THRESHOLD: ${{ github.event.inputs.chunk_threshold_bytes }}
+        run: |
+          set -euo pipefail
+          SRC="source_file/$FINAL_FILE"
+          SIZE=$(stat -c '%s' "$SRC")
+          echo "FILE_SIZE=$SIZE"
+
+          MAX_PART=2040109465  # 2 GiB - 100 MiB safety margin
+          if [ -z "${THRESHOLD:-}" ] || [ "$THRESHOLD" -le 0 ]; then
+            THRESHOLD=$MAX_PART
+          fi
+          if [ "$THRESHOLD" -gt "$MAX_PART" ]; then
+            THRESHOLD=$MAX_PART
+          fi
+          echo "THRESHOLD=$THRESHOLD"
+
+          mkdir -p upload_parts
+          if [ "$SIZE" -le "$THRESHOLD" ]; then
+            echo "Single asset upload – file fits under threshold."
+            cp "$SRC" "upload_parts/$FINAL_FILE"
+            cp "$SRC.sha256" "upload_parts/$FINAL_FILE.sha256"
+            echo "PART_COUNT=1" >> "$GITHUB_ENV"
+            echo "IS_SPLIT=false" >> "$GITHUB_ENV"
+          else
+            # Calculate optimal part count (ceil division)
+            PARTS=$(( (SIZE + THRESHOLD - 1) / THRESHOLD ))
+            PART_BYTES=$(( (SIZE + PARTS - 1) / PARTS ))
+            echo "Splitting $FINAL_FILE ($SIZE bytes) into $PARTS parts of ~$PART_BYTES bytes each."
+
+            # Split with numeric suffix, 2 digits (enough for up to 99 parts)
+            split -d -a 2 -b "$PART_BYTES" "$SRC" "upload_parts/${FINAL_FILE}.part"
+
+            # Also split checksum? Not needed – we'll generate per-part checksums
+            for part in upload_parts/${FINAL_FILE}.part*; do
+              sha256sum "$part" | cut -d' ' -f1 > "${part}.sha256"
+            done
+
+            echo "PART_COUNT=$PARTS" >> "$GITHUB_ENV"
+            echo "IS_SPLIT=true" >> "$GITHUB_ENV"
+          fi
+
+          ls -lh upload_parts/
+
+      # ----------------------------------------------------------------------
+      # 6. Create or reuse release (idempotent)
+      # ----------------------------------------------------------------------
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.release_tag }}
+          TITLE: ${{ github.event.inputs.release_title }}
+        run: |
+          set -euo pipefail
+          [ -n "${TAG:-}" ] || { echo "::error::release_tag is empty"; exit 1; }
+          DISPLAY_TITLE="${TITLE:-$TAG}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists – will append assets."
+          else
+            echo "Creating release $TAG ($DISPLAY_TITLE)..."
+            gh release create "$TAG" \
+              --title "$DISPLAY_TITLE" \
+              --notes "Uploaded by OctoFetch (folder: $FOLDER)" \
+              --target "${GITHUB_REF_NAME:-main}"
+          fi
+
+      # ----------------------------------------------------------------------
+      # 7. Upload assets in parallel (up to 3 concurrent) with retry logic
+      # ----------------------------------------------------------------------
+      - name: Upload assets in parallel (with exponential backoff)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          upload_with_retry() {
+            local file="$1"
+            local max_attempts=5
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              if gh release upload "$TAG" "$file" --clobber; then
+                echo "✅ Uploaded: $(basename "$file")"
+                return 0
+              else
+                local wait=$(( (2 ** attempt) + (RANDOM % 5) ))
+                echo "⚠️  Attempt $attempt failed for $(basename "$file"), retrying in ${wait}s"
+                sleep $wait
+                attempt=$((attempt + 1))
+              fi
+            done
+            echo "::error::Failed to upload $(basename "$file") after $max_attempts attempts"
+            return 1
+          }
+          export -f upload_with_retry
+          export GH_TOKEN TAG
+
+          # Upload up to 3 files in parallel (respects API rate limits)
+          find upload_parts -type f ! -name "*.sha256" -print0 | \
+            xargs -0 -P 3 -I {} bash -c 'upload_with_retry "$@"' _ {}
+
+          # Also upload checksum files (small, no need for heavy parallelism)
+          for chk in upload_parts/*.sha256; do
+            [ -f "$chk" ] && gh release upload "$TAG" "$chk" --clobber
+          done
+
+      # ----------------------------------------------------------------------
+      # 8. Build manifest JSON (mirroring original schema but with checksums)
+      # ----------------------------------------------------------------------
+      - name: Build manifest
+        run: |
+          set -euo pipefail
+          mkdir -p ".octofetch/releases/$FOLDER"
+
+          # Fetch release info from GitHub API
+          gh api "repos/$GH_REPO/releases/tags/$TAG" \
+            -H 'Accept: application/vnd.github+json' > release.json
+
+          # Build manifest with added checksum info
+          jq --arg folder "$FOLDER" \
+             --arg tag    "$TAG" \
+             --arg base   "$FINAL_FILE" \
+             --arg split  "$IS_SPLIT" \
+             --argjson parts "${PART_COUNT:-1}" \
+             --arg checksum "$CHECKSUM" \
+             '{
+                destination: "release",
+                tag: $tag,
+                folder: $folder,
+                base_name: $base,
+                is_split: ($split == "true"),
+                part_count: $parts,
+                sha256: $checksum,
+                release_url: .html_url,
+                files: [
+                  .assets[] | {
+                    name: .name,
+                    url: .browser_download_url,
+                    api_url: .url,
+                    id: .id,
+                    size: .size,
+                    download_count: .download_count,
+                    sha256: (if (.name | endswith(".sha256")) then empty else (.name + ".sha256" | ascii_upcase) end)
+                  }
+                ]
+              }' release.json > ".octofetch/releases/$FOLDER/links.json"
+
+      # ----------------------------------------------------------------------
+      # 9. Atomic commit of manifest using git worktree (no race conditions)
+      # ----------------------------------------------------------------------
+      - name: Commit links manifest (atomic, conflict-free)
+        env:
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "OctoFetchBot"
+          git config user.email "bot@octofetch.local"
+
+          # Create a temporary worktree to avoid interfering with main checkout
+          WORKTREE_DIR="../manifest-commit-$$"
+          git worktree add "$WORKTREE_DIR" "$(git rev-parse --abbrev-ref HEAD)"
+
+          cd "$WORKTREE_DIR"
+          mkdir -p ".octofetch/releases/$FOLDER"
+          cp "$GITHUB_WORKSPACE/.octofetch/releases/$FOLDER/links.json" \
+             ".octofetch/releases/$FOLDER/links.json"
+
+          if git add -- ".octofetch/releases/$FOLDER/links.json" && \
+             git diff --cached --quiet; then
+            echo "No changes to manifest – skipping commit"
+          else
+            git commit -m "Release: $FOLDER ($TAG) links manifest"
+            # Retry push with exponential backoff
+            for attempt in 1 2 3 4 5; do
+              if git push origin HEAD:"$(git rev-parse --abbrev-ref HEAD)"; then
+                echo "Manifest pushed successfully"
+                break
+              fi
+              sleep $((2 ** attempt))
+            done
+          fi
+
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove "$WORKTREE_DIR"
+
+      # ----------------------------------------------------------------------
+      # 10. Cleanup (always runs, even on failure)
+      # ----------------------------------------------------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf source_file upload_parts .octofetch/releases/*/links.json.tmp 2>/dev/null || true
+          docker system prune -f 2>/dev/null || true  # free runner space
+
+      # ----------------------------------------------------------------------
+      # 11. Output summary
+      # ----------------------------------------------------------------------
+      - name: Summary
+        if: success()
+        run: |
+          echo "## ✅ Release complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ github.event.inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Folder:** $FOLDER" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** $FINAL_FILE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Size:** $(numfmt --to=iec $FILE_SIZE)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Split:** $IS_SPLIT (${PART_COUNT:-1} part(s))" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA256:** \`$CHECKSUM\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release URL:** https://github.com/${{ github.repository }}/releases/tag/${{ github.event.inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
